@@ -1,0 +1,31 @@
+# StreetLearn pure Python engine - dependencies
+# Install: pip install -r requirements.txt
+
+# Core dependencies (required)
+plyvel>=1.5.0          # LevelDB Python binding (reads StreetLearn dataset)
+numpy>=1.20.0          # Numerical computing (projection, rendering)
+Pillow>=9.0.0          # JPEG decoding for panorama images
+protobuf>=3.19.0       # Protobuf runtime (for streetlearn.proto)
+
+# Recommended (performance)
+opencv-python>=4.5.0   # Faster image projection via cv2.remap
+
+# Python environment layer (used by game/observations)
+absl-py>=1.0.0         # Logging (used by streetlearn.py, game.py)
+six>=1.16.0            # Python 2/3 compatibility (used by observations.py)
+inflection>=0.5.1      # String utilities (used by streetlearn.py)
+
+# Optional (engine demo etc.)
+# pygame>=2.1.0        # was used by the removed human_agent UI
+
+# PyTorch PPO training (replaces IMPALA) — streetlearn/python/ppo_train.py
+# + streetlearn/python/agents/ppo_agent.py
+# The original IMPALA agents (TF1 + Sonnet) have been removed.
+# Install the CUDA build matching your driver from https://pytorch.org if you
+# want GPU training; the CPU build works for small-scale experiments.
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Training-curve / evaluation plotting — streetlearn/tools/plot_ppo_log.py
+# + streetlearn/tools/plot_ppo_eval.py
+matplotlib>=3.5.0

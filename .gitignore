@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Generated protobuf
+streetlearn/proto/*_pb2.py
+streetlearn/proto/*_pb2_grpc.py
+
+# Datasets (LevelDB) — do not commit
+*.ldb
+*.log
+MANIFEST-*
+CURRENT
+LOCK
+LOG
+
+# Training artifacts
+*.pth
+*.pt
+*.ckpt
+train_metrics.csv
+eval_results.csv
+ppo_curves.png
+ppo_eval_triple.png
+ppo_eval_triple_*.png
+
+# Environments
+.env
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
