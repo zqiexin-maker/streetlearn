@@ -4,8 +4,6 @@
 
 Pure Python implementation of the [**StreetLearn**](http://streetlearn.cc) engine and environment for training navigation agents in real-world photographic street environments. Originally developed by Google DeepMind (NeurIPS 2018), this version **removes all C++/Bazel/CLIF dependencies** — the entire engine is implemented in Python using numpy, Pillow, and plyvel.
 
-> 训练栈已切换为 **PyTorch PPO**（原 IMPALA/TensorFlow-Sonnet 的 agents、experiment.py 与 ui/ 调试智能体已删除）。
-
 This environment was used in:
 - [1] ["Learning to Navigate in Cities Without a Map"](http://papers.nips.cc/paper/7509-learning-to-navigate-in-cities-without-a-map) (NeurIPS 2018)
 - [2] ["Cross-View Policy Learning for Street Navigation"](https://arxiv.org/pdf/1906.05930) (ICCV 2019)
