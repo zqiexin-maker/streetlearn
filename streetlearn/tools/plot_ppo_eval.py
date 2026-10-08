@@ -3,11 +3,12 @@
 """把评估结果画成「Agent 贪心 vs Oracle 实跑」对比图（论文口径，BFS 上界作参考线）。
 
 数据源：ppo_eval.py 每次评估把一行结果写入 eval_results.csv，列：
-    mode,tag,episodes,arrival,spl,oracle,coverage,t_half,fail_rate
+    mode,tag,episodes,arrival,spl,oracle,coverage,t_half,fail_rate,success_steps,...
 其中：
   - mode=normal, tag=agent    → Agent 贪心评估（argmax）
   - mode=oracle, tag=actual   → Oracle 实跑（用 bearing 真正导航，差异 6）
   - oracle 列 = BFS 上界：每 episode 目标的最短路径节点数，即到达奖励的理论满分
+  - success_steps = 成功 episode 的平均到达步数（要和失败率一起看）
 
 图的内容（上排三个面板，下方数值表）：
     1) 到达奖励 arrival（panos/episode，越高越好）：虚线 = BFS 上界，
@@ -87,8 +88,11 @@ def _metrics(row):
     if row is None:
         return None
     t_half = _f(row, "t_half")
+    steps = _f(row, "success_steps")
     return {
         "episodes": int(_f(row, "episodes")),
+        # 成功 episode 的平均到达步数；0 = 没有成功（或旧 CSV 没有这一列）。
+        "success_steps": steps if steps > 0 else float("nan"),
         "arrival": _f(row, "arrival"),
         "bfs": _f(row, "oracle"),
         "success": 1.0 - _f(row, "fail_rate"),
@@ -97,6 +101,7 @@ def _metrics(row):
         "spl": _f(row, "spl"),
         # t_half=0 是 ppo_eval 在"没有任何目标走到半程"时写的占位值，不是 0 步。
         "t_half": t_half if t_half > 0 else float("nan"),
+        "goal_band": (row.get("goal_band") or "").strip(),
     }
 
 
@@ -253,8 +258,8 @@ def _table(ax, m):
     ax.set_ylim(0, 1)
     header = ["Episodes", "Arrival", "BFS ceiling", "Arrival / BFS",
               "Success rate", "Failure rate", "Coverage", "SPL",
-              r"$T_{1/2}$ (steps)"]
-    right_edges = np.linspace(0.30, 1.0, len(header))
+              r"$T_{1/2}$ (steps)", "Steps to goal"]
+    right_edges = np.linspace(0.27, 1.0, len(header))
     y_header, y_rows = 0.84, (0.50, 0.17)
     for x, name in zip(right_edges, header):
         ax.text(x, y_header, name, ha="right", va="center", fontsize=10,
@@ -276,7 +281,9 @@ def _table(ax, m):
                  "%.1f" % s["bfs"], ("%.0f%%" % pct) if pct is not None else "-",
                  "%.2f" % s["success"], "%.2f" % s["fail"],
                  "%.2f" % s["coverage"], "%.2f" % s["spl"],
-                 ("%.0f" % s["t_half"]) if np.isfinite(s["t_half"]) else "n/a"]
+                 ("%.0f" % s["t_half"]) if np.isfinite(s["t_half"]) else "n/a",
+                 ("%.0f" % s["success_steps"]) if np.isfinite(s["success_steps"])
+                 else "n/a"]
         for x, cell in zip(right_edges, cells):
             ax.text(x, y, cell, ha="right", va="center", fontsize=10.5,
                     color=INK)
@@ -289,6 +296,10 @@ def plot(m):
              ha="left", va="top", fontsize=16, fontweight="bold", color=INK)
     subtitle = "Episodes: " + ", ".join(
         "%s %d" % (label, s["episodes"]) for label, _, s in runs)
+    bands = sorted({s["goal_band"] for _, _, s in runs if s["goal_band"]})
+    if bands:
+        subtitle += "  ·  goal distance: " + " / ".join(
+            "full map" if b == "full" else b for b in bands)
     subtitle += ("  ·  BFS ceiling = shortest-path length (panos) to each "
                  "goal, the maximum arrival reward")
     fig.text(0.05, 0.912, subtitle, ha="left", va="top", fontsize=10.5,

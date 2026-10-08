@@ -21,6 +21,13 @@
     真正把 Oracle 导航跑一遍，给出 Oracle 的"实际"到达/SPL/T_1/2/失败率，
     而不只是 BFS 节点数上界。
   - held-out 泛化：目标只从未训练见过的 out 集合抽（--held_out）。
+  - 目标距离段（--goal_band）：full = 全图（默认）；stage = checkpoint 记录的
+    课程档位，如 300m 档测 (200, 300] 米；也可写 "LOW,HIGH"（米）。
+
+每个环境事先分到固定数量的 episode（配额），各自只跑自己的那几条：被统计的
+就是"每个环境的前 k 条路线"。旧做法是"谁先跑完谁领下一条、凑够 N 条就停"，
+短（多为成功）的路线先跑完，长（多为失败）的路线被截掉，成功率会系统性偏高，
+Agent / Oracle 两遍也对不上同一批路线。
 
 用法示例：
   # Agent 贪心评估（与训练 frame_cap 一致的 --max_steps）
@@ -45,15 +52,248 @@ import time
 import numpy as np
 import torch
 
+from streetlearn.python.agents.ppo_agent import (
+    agent_kwargs_from_checkpoint,
+    describe_agent,
+)
 from streetlearn.python.ppo_train import (
     SubprocVecEnv,
     latlng_bbox_note,
     obs_to_batch,
     PPOAgent,
+    reward_config_note,
 )
 
 # Oracle 朝向容差（论文用 30°；与 oracle_agent.py 一致）。
 TOL_BEARING = 30.0
+
+# success_steps：成功 episode 到达目标所用的动作数（均值；没有成功时为 0）。
+# 只看它不够——只会完成简单任务也能得到很短的平均步数，要和 fail_rate 一起看。
+EVAL_CSV_FIELDS = ["mode", "tag", "episodes", "arrival", "spl", "oracle",
+                   "coverage", "t_half", "fail_rate", "success_steps", "goal_band",
+                   "checkpoint"]
+
+
+# --------------------------------------------------------------------------- #
+# 固定配额的 episode 调度（课程测试与独立评估共用）
+# --------------------------------------------------------------------------- #
+def split_quota(total, n_envs):
+    """把 total 条路线尽量均分给 n_envs 个环境（余数给前几个）。"""
+    base, extra = divmod(int(total), int(n_envs))
+    return [base + int(i < extra) for i in range(int(n_envs))]
+
+
+class AgentPolicy(object):
+    """贪心（argmax）Agent：按环境维护双 LSTM 记忆与上一步 reward/action。"""
+
+    def __init__(self, agent, n_envs, device, view_shape):
+        self.agent = agent
+        self.device = device
+        self.view_shape = view_shape
+        self.state = list(agent.initial_state(n_envs, device))  # hp, cp, hg, cg
+        self.prev_rewards = np.zeros(n_envs, dtype=np.float32)
+        self.prev_actions = np.zeros(n_envs, dtype=np.int64)
+
+    def reset(self, e):
+        for s in self.state:
+            s[:, e:e + 1, :] = 0.0
+        self.prev_rewards[e] = 0.0
+        self.prev_actions[e] = 0
+
+    def act(self, indices, obs):
+        """只对 indices 这几个环境前向（已跑完配额的环境不参与）。"""
+        idx = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        view, scalar, pr, pa = obs_to_batch(
+            obs, self.device, self.view_shape,
+            self.prev_rewards[indices], self.prev_actions[indices])
+        with torch.no_grad():
+            logits, _, hp, cp, hg, cg, _ = self.agent(
+                view, scalar, pr, pa, *(s.index_select(1, idx) for s in self.state))
+        for s, new in zip(self.state, (hp, cp, hg, cg)):
+            s.index_copy_(1, idx, new)
+        return torch.argmax(logits, dim=1).cpu().tolist()
+
+    def observe(self, e, action, reward, done, info):
+        if done:
+            self.reset(e)
+        else:
+            self.prev_rewards[e] = float(reward)
+            self.prev_actions[e] = int(action)
+
+
+class OraclePolicy(object):
+    """Oracle：沿 BFS 最短路的下一个 pano 方位角转向 / 前进。"""
+
+    def __init__(self, n_envs, rot_speed):
+        self.rot_speed = rot_speed
+        self.last_info = [None] * n_envs
+
+    def reset(self, e):
+        self.last_info[e] = None
+
+    def act(self, indices, obs):
+        # 首步先前进，拿到首个 info（含 bearing_to_next_pano）。
+        return [0 if self.last_info[e] is None else
+                _bearing_to_action(self.last_info[e].get("bearing_to_next_pano", 0.0),
+                                   self.rot_speed)
+                for e in indices]
+
+    def observe(self, e, action, reward, done, info):
+        self.last_info[e] = None if done else info
+
+
+def run_quota_episodes(env, policy, quotas, frame_cap, on_step=None,
+                       on_episode_end=None, on_reset=None):
+    """环境 e 恰好连续跑 quotas[e] 个 episode；配额为 0 的环境不参与。
+
+    每个 episode 至多 frame_cap + 1 步，因此总迭代数有上界；超过上界说明
+    episode 没能结束（环境异常），直接报错而不是无限循环。
+    """
+    remaining = list(quotas)
+    active = [e for e in range(len(quotas)) if remaining[e] > 0]
+    if not active:
+        return
+    obs = [None] * len(quotas)
+
+    def start(indices):
+        for e, o in zip(indices, env.reset_indices(indices)):
+            obs[e] = o
+            policy.reset(e)
+            if on_reset:
+                on_reset(e)
+
+    start(active)
+    max_iters = max(quotas) * (frame_cap + 1) + 16
+    for _ in range(max_iters):
+        if not active:
+            return
+        actions = policy.act(active, [obs[e] for e in active])
+        next_obs, rewards, dones, infos = env.step(actions, indices=active)
+        restart = []
+        for k, e in enumerate(active):
+            obs[e] = next_obs[k]
+            if on_step:
+                on_step(e, infos[k])
+            policy.observe(e, actions[k], rewards[k], dones[k], infos[k])
+            if dones[k]:
+                if on_episode_end:
+                    on_episode_end(e, infos[k])
+                remaining[e] -= 1
+                if remaining[e] > 0:
+                    restart.append(e)
+        if restart:
+            start(restart)
+        active = [e for e in active if remaining[e] > 0]
+    if active:
+        raise RuntimeError("%d env(s) did not finish their episodes within %d steps"
+                           % (len(active), max_iters))
+
+
+# --------------------------------------------------------------------------- #
+# 课程阶段测试（训练中调用，借用训练环境）
+# --------------------------------------------------------------------------- #
+def evaluate_curriculum(agent, env, config, lower_m, upper_m, seed,
+                        episode_count, max_envs=0, rank=0, world_size=1):
+    """在 (lower_m, upper_m] 米距离段内跑本 rank 分到的单目标测试路线。
+
+    直接借用训练用的 SubprocVecEnv（测试期间训练环境本来就闲着），省去每次
+    测试重新起进程、建图、算扩展图的几分钟。调用方负责在测试后用
+    set_train_mode 恢复训练采样并重置全部环境。
+
+    返回本 rank 的计数/求和量，由训练脚本跨 rank 汇总。
+    """
+    started = time.monotonic()
+    empty = {"episodes": 0, "successes": 0, "spl_sum": 0.0,
+             "success_steps_sum": 0, "max_goal_distance": 0.0,
+             "max_success_distance": 0.0, "max_success_steps": 0,
+             "seconds": 0.0}
+    if episode_count <= 0:
+        return empty
+    n_used = env.n_envs if max_envs <= 0 else min(max_envs, env.n_envs)
+    n_used = min(n_used, episode_count)
+    quotas = split_quota(episode_count, n_used) + [0] * (env.n_envs - n_used)
+    print("[PPO] curriculum eval rank=%d/%d: band=(%.0f,%.0f]m episodes=%d "
+          "envs=%d" % (rank, world_size, lower_m, upper_m, episode_count, n_used),
+          flush=True)
+
+    records = []  # (success, goal_distance, spl, steps)
+
+    def on_episode_end(e, info):
+        distance = float(info["initial_distance_to_goal"])
+        if not lower_m < distance <= upper_m:
+            raise RuntimeError("Evaluation goal outside distance band (%.0f, %.0f]: "
+                               "%.2f" % (lower_m, upper_m, distance))
+        success = int(info.get("num_successes", 0)) > 0
+        records.append((success, distance,
+                        float(info.get("spl_without_last_goal", 0.0) or 0.0),
+                        int(info["num_steps_this_goal"]) if success else 0))
+
+    env.set_eval_mode(seed, lower_m, upper_m)
+    device = next(agent.parameters()).device
+    policy = AgentPolicy(agent, env.n_envs, device,
+                         (3, config["height"], config["width"]))
+    was_training = agent.training
+    agent.eval()
+    try:
+        run_quota_episodes(env, policy, quotas, config["frame_cap"],
+                           on_episode_end=on_episode_end)
+    finally:
+        agent.train(was_training)
+    if len(records) != episode_count:
+        raise RuntimeError("Evaluation finished %d/%d episodes"
+                           % (len(records), episode_count))
+    seconds = time.monotonic() - started
+    successes = [r for r in records if r[0]]
+    print("[PPO] curriculum eval rank=%d/%d finished: %d/%d reached in %.1fs"
+          % (rank, world_size, len(successes), len(records), seconds), flush=True)
+    return {
+        "episodes": len(records),
+        "successes": len(successes),
+        "spl_sum": float(sum(r[2] for r in records)),
+        "success_steps_sum": sum(r[3] for r in successes),
+        "max_goal_distance": max(r[1] for r in records),
+        "max_success_distance": max((r[1] for r in successes), default=0.0),
+        "max_success_steps": max((r[3] for r in successes), default=0),
+        "seconds": seconds,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 独立评估（python run.py eval / eval_oracle / eval_all）
+# --------------------------------------------------------------------------- #
+def resolve_goal_band(spec, ckpt):
+    """--goal_band -> (lower_m, upper_m) 或 None（全图）。
+
+    full：全图（不限距离，原行为）；stage：checkpoint 记录的课程档位
+    （best / final 是它所在的那一档，before_stage_K 是即将开始的第 K 档）；
+    "LOW,HIGH"：显式距离段（米），目标严格落在 (LOW, HIGH] 内。
+    """
+    spec = str(spec or "full").strip().lower()
+    if spec in ("full", "none", ""):
+        return None
+    if spec == "stage":
+        state = ckpt.get("curriculum_state") or {}
+        stages = state.get("stages") or []
+        if not stages:
+            print("[EVAL] checkpoint has no curriculum stage; --goal_band stage "
+                  "falls back to the full map")
+            return None
+        idx = min(int(state.get("index", 0)), len(stages) - 1)
+        lower = (stages[idx - 1] if idx > 0
+                 else ckpt["config"].get("min_radius_meters", 100.0))
+        return float(lower), float(stages[idx])
+    try:
+        lower, upper = (float(x) for x in spec.split(","))
+    except ValueError:
+        raise ValueError("--goal_band must be full / stage / 'LOW,HIGH' (meters), "
+                         "got %r" % spec)
+    if not 0 <= lower < upper:
+        raise ValueError("--goal_band needs 0 <= LOW < HIGH, got %r" % spec)
+    return lower, upper
+
+
+def band_label(band):
+    return "full" if band is None else "%g-%gm" % band
 
 
 def _bearing_to_action(bearing, rot_speed):
@@ -75,39 +315,40 @@ def _bearing_to_action(bearing, rot_speed):
 class _EvalTracker:
     """跨 episode 评估指标聚合器（Agent 与 Oracle 共用）。
 
-    维护每个环境的"当前目标"进度，用于统计 T_1/2（覆盖一半目标距离所需步数）
-    与每 episode 的到达/失败情况。
+    T_1/2 = 第一次走到"离目标不超过初始直线距离一半"时已用的步数，
+    用 info 里的实时距离 distance_to_goal 判断（min_distance_reached 只在
+    塑形窗口内更新，窗口小于半程时会漏判）。
     """
 
     def __init__(self, n_envs):
-        self.n = n_envs
-        self.last_goal_id = [None] * n_envs
-        self.steps_since_goal = [0] * n_envs
-        self.init_dist = [0.0] * n_envs
-        self.recorded_half = [False] * n_envs
+        self.half_recorded = [False] * n_envs
+        self.arrival_recorded = [False] * n_envs
         # 累计指标。
         self.arrivals, self.oracles, self.spls, self.coverages = [], [], [], []
         self.t_half_list = []          # 每个目标的 T_1/2（步）
+        self.success_steps = []        # 成功 episode 到达目标所用的步数
         self.ep_success, self.ep_total = 0, 0
 
-    def on_step(self, e, infos_e):
-        """每个环境每步调用，更新 T_1/2 追踪。"""
-        gid = infos_e.get("current_goal_id", None)
-        if gid != self.last_goal_id[e]:
-            # 新目标：重置进度。
-            self.last_goal_id[e] = gid
-            self.steps_since_goal[e] = 0
-            self.init_dist[e] = float(infos_e.get("initial_distance_to_goal", 0.0))
-            self.recorded_half[e] = False
-        else:
-            self.steps_since_goal[e] += 1
-        if (not self.recorded_half[e]) and self.init_dist[e] > 1.0:
-            min_d = float(infos_e.get("min_distance_reached", 1e9))
-            if min_d <= 0.5 * self.init_dist[e]:
-                self.t_half_list.append(self.steps_since_goal[e])
-                self.recorded_half[e] = True
+    def on_reset(self, e):
+        self.half_recorded[e] = False
+        self.arrival_recorded[e] = False
 
-    def on_episode_end(self, infos_e):
+    def on_step(self, e, infos_e):
+        if (not self.arrival_recorded[e]
+                and int(infos_e.get("num_successes", 0) or 0) > 0):
+            self.success_steps.append(int(infos_e.get("num_steps_this_goal", 0)))
+            self.arrival_recorded[e] = True
+        if self.half_recorded[e]:
+            return
+        init = float(infos_e.get("initial_distance_to_goal", 0.0) or 0.0)
+        now = infos_e.get("distance_to_goal")
+        if now is None:  # 旧环境没有实时距离时退回 min_distance_reached
+            now = infos_e.get("min_distance_reached", 1e9)
+        if init > 1.0 and float(now) <= 0.5 * init:
+            self.t_half_list.append(int(infos_e.get("num_steps_this_goal", 0)))
+            self.half_recorded[e] = True
+
+    def on_episode_end(self, e, infos_e):
         """episode 结束（done）时调用，汇总该 episode。"""
         self.ep_total += 1
         arr = infos_e.get("arrival_reward", 0.0)
@@ -123,46 +364,49 @@ class _EvalTracker:
             self.ep_success += 1
 
 
-def _print_and_save(mode, tag, args, arr, orc, spl, cov, t_half, fail):
+def _print_and_save(mode, tag, args, arr, orc, spl, cov, t_half, fail, band,
+                    success_steps=()):
     n = max(1, len(arr))
     mean_arr = float(np.mean(arr)) if arr else 0.0
     mean_orc = float(np.mean(orc)) if orc else 0.0
     mean_spl = float(np.mean(spl)) if spl else 0.0
     mean_cov = float(np.mean(cov)) if cov else 0.0
     mean_t12 = float(np.mean(t_half)) if t_half else 0.0
-    fail_rate = float(fail) if isinstance(fail, float) else (
-        (1.0 - float(np.mean(fail))) if fail else 0.0)
+    mean_steps = float(np.mean(success_steps)) if success_steps else 0.0
+    fail_rate = float(fail)
     print("=" * 68)
-    print("[EVAL:%s] mode=%s  episodes=%d" % (tag, mode, n))
+    print("[EVAL:%s] mode=%s  episodes=%d  goal_band=%s" % (tag, mode, n, band_label(band)))
     print("  arrival_reward = %.2f" % mean_arr)
     print("  SPL            = %.3f" % mean_spl)
     print("  Oracle reward  = %.2f   (ceiling)" % mean_orc)
     print("  coverage       = %.3f" % mean_cov)
     print("  T_1/2 (steps)  = %.1f   (半程步数)" % mean_t12)
     print("  failure_rate   = %.3f" % fail_rate)
+    print("  success_steps  = %s   (成功 episode 的到达步数，%d 条)"
+          % ("%.1f" % mean_steps if success_steps else "n/a", len(success_steps)))
     print("=" * 68)
     print("EVAL_CSV mode=%s tag=%s episodes=%d arrival=%.4f spl=%.4f "
-          "oracle=%.4f coverage=%.4f t_half=%.4f fail_rate=%.4f"
+          "oracle=%.4f coverage=%.4f t_half=%.4f fail_rate=%.4f success_steps=%.1f"
           % (mode, tag, n, mean_arr, mean_spl, mean_orc, mean_cov,
-             mean_t12, fail_rate))
+             mean_t12, fail_rate, mean_steps))
     # 落盘（按 mode+tag 覆盖写，便于多次评估对比）。
-    row = [mode, tag, n, round(mean_arr, 4), round(mean_spl, 4),
-           round(mean_orc, 4), round(mean_cov, 4),
-           round(mean_t12, 4), round(fail_rate, 4)]
+    row = {"mode": mode, "tag": tag, "episodes": n,
+           "arrival": round(mean_arr, 4), "spl": round(mean_spl, 4),
+           "oracle": round(mean_orc, 4), "coverage": round(mean_cov, 4),
+           "t_half": round(mean_t12, 4), "fail_rate": round(fail_rate, 4),
+           "success_steps": round(mean_steps, 1),
+           "goal_band": band_label(band),
+           "checkpoint": os.path.basename(args.checkpoint)}
     try:
         os.makedirs(os.path.dirname(args.eval_csv) or ".", exist_ok=True)
         existing = []
         if os.path.exists(args.eval_csv):
             with open(args.eval_csv, "r", newline="") as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                for r in reader:
-                    if len(r) >= 2 and not (r[0] == mode and r[1] == tag):
-                        existing.append(r)
+                existing = [r for r in csv.DictReader(f)
+                            if not (r.get("mode") == mode and r.get("tag") == tag)]
         with open(args.eval_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["mode", "tag", "episodes", "arrival", "spl",
-                        "oracle", "coverage", "t_half", "fail_rate"])
+            w = csv.DictWriter(f, fieldnames=EVAL_CSV_FIELDS, extrasaction="ignore")
+            w.writeheader()
             for r in existing:
                 w.writerow(r)
             w.writerow(row)
@@ -176,122 +420,71 @@ def run_eval(args):
     device = torch.device("cuda" if (args.cuda and torch.cuda.is_available())
                           else "cpu")
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    # 本项目自己存的 checkpoint（含 config 字典），PyTorch 2.6+ 默认的
+    # weights_only=True 会拒绝加载。
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = ckpt["config"]
-    num_actions = ckpt["num_actions"]
-    scalar_dim = ckpt["scalar_dim"]
-    hidden_size = ckpt.get("hidden_size", 512)
-    aux_heading = ckpt.get("aux_heading", False)
-    goal_type = ckpt.get("goal_type", "target_latlng")
-    vision_backbone = ckpt.get("vision_backbone", "resnet18")
     rot_speed = float(config.get("rotation_speed", 22.5))
+    band = resolve_goal_band(args.goal_band, ckpt)
     # latlng 观测的归一化范围必须与训练一致：环境直接用 checkpoint 保存的 config，
     # 旧 checkpoint（全球范围）与新 checkpoint（数据集范围）各按自己的口径评估。
     print("[EVAL] latlng bbox (from checkpoint): %s" % latlng_bbox_note(config))
+    print("[EVAL] reward config (from checkpoint): %s" % reward_config_note(config))
+    print("[EVAL] goal band: %s" % band_label(band))
 
-    env = SubprocVecEnv(args.dataset_path, config, args.num_envs)
-    if args.held_out:
-        env.setup_held_out(args.held_out_fraction, seed=args.seed,
-                           use_held_out=True)
-        print("[EVAL] held-out ON: targets drawn from OUT set "
-              "(%.0f%% held out)" % (100.0 * args.held_out_fraction))
-
-    # ---- 评估 head-to-head：固定目标采样 ----
-    # Agent/Oracle 两遍评估用相同 --goal_seed（默认回退到 --seed）与 --seed，
-    # 且 --num_envs 一致，即可抽到完全相同的 (起点,目标) 序列，得到严格的
-    # paper-metric head-to-head 对比（BFS 上界也会一致）。
+    n_envs = max(1, min(args.num_envs, args.num_episodes))
+    quotas = split_quota(args.num_episodes, n_envs)
     goal_seed = args.goal_seed if args.goal_seed is not None else args.seed
-    env.set_goal_seed(goal_seed)
-    env.set_single_goal_mode(True)
-    print("[EVAL] goal_seed=%d -> single-goal head-to-head mode ON. "
-          "For a fair Agent-vs-Oracle compare, run BOTH with the SAME "
-          "--seed and --goal_seed (and --num_envs)." % goal_seed)
+    env = SubprocVecEnv(args.dataset_path, config, n_envs,
+                        cache_dir=args.ds_cache_dir)
+    try:
+        if args.held_out:
+            env.setup_held_out(args.held_out_fraction, seed=args.seed,
+                               use_held_out=True)
+            print("[EVAL] held-out ON: targets drawn from OUT set "
+                  "(%.0f%% held out)" % (100.0 * args.held_out_fraction))
 
-    view_shape = (3, config["height"], config["width"])
-    tracker = _EvalTracker(args.num_envs)
-    t0 = time.time()
+        # ---- 评估 head-to-head：固定目标采样 ----
+        # Agent/Oracle 两遍评估用相同 --goal_seed（默认回退到 --seed）、--seed、
+        # --num_envs、--num_episodes：每个环境的 (起点, 目标) 序列由种子决定，
+        # 再配合固定配额，两遍跑的是同一批路线。
+        env.set_goal_seed(goal_seed)
+        env.set_single_goal_mode(True)
+        # 到达即结束 episode（与课程阶段测试一致）：单目标下到达后不会再有奖励，
+        # 各项指标不变，只是不用空跑到 frame_cap。
+        env.set_end_on_success(True)
+        if band is not None:
+            env.set_target_distance_band(*band)
+        print("[EVAL] goal_seed=%d single-goal mode, %d episodes on %d envs "
+              "(fixed per-env quota)." % (goal_seed, args.num_episodes, n_envs))
 
-    if args.oracle:
-        # ---- Oracle 实跑（差异 6）：用 bearing 真正导航 ----
-        last_info = [None] * args.num_envs
-        obs_list = env.reset()
-        max_iters = int(args.num_episodes / args.num_envs * args.max_steps * 2) + 16
-        with torch.no_grad():
-            for _ in range(max_iters):
-                if tracker.ep_total >= args.num_episodes:
-                    break
-                actions = []
-                for e in range(args.num_envs):
-                    if last_info[e] is None:
-                        actions.append(0)  # 首步先前进，拿到首个 info(bearing)
-                    else:
-                        b = last_info[e].get("bearing_to_next_pano", 0.0)
-                        actions.append(_bearing_to_action(b, rot_speed))
-                next_obs, rewards, dones, infos = env.step(actions)
-                for e in range(args.num_envs):
-                    tracker.on_step(e, infos[e])
-                    last_info[e] = infos[e]
-                    if dones[e]:
-                        tracker.on_episode_end(infos[e])
-                        next_obs[e] = env.reset(e)
-                        last_info[e] = None
-                obs_list = next_obs
+        if args.oracle:
+            policy = OraclePolicy(n_envs, rot_speed)
+        else:
+            # 网络结构 / 输入遮蔽按 checkpoint 元数据重建（旧 checkpoint = 并联、不遮蔽）。
+            agent = PPOAgent(**agent_kwargs_from_checkpoint(ckpt)).to(device)
+            agent.load_state_dict(ckpt["agent"])
+            agent.eval()
+            print("[EVAL] model (from checkpoint): %s" % describe_agent(agent))
+            policy = AgentPolicy(agent, n_envs, device,
+                                 (3, config["height"], config["width"]))
+
+        tracker = _EvalTracker(n_envs)
+        t0 = time.time()
+        run_quota_episodes(env, policy, quotas, config["frame_cap"],
+                           on_step=tracker.on_step,
+                           on_episode_end=tracker.on_episode_end,
+                           on_reset=tracker.on_reset)
+        print("[EVAL] %d episodes in %.1fs" % (tracker.ep_total, time.time() - t0))
+    finally:
         env.close()
-        _print_and_save("oracle", "actual", args, tracker.arrivals,
-                        tracker.oracles, tracker.spls, tracker.coverages,
-                        tracker.t_half_list,
-                        (1.0 - tracker.ep_success / max(1, tracker.ep_total)))
-        return
 
-    # ---- Agent 贪心评估（argmax）----
-    agent = PPOAgent(
-        num_actions=num_actions,
-        hidden_size=hidden_size,
-        aux_heading=aux_heading,
-        pretrained_vision=ckpt.get("pretrained_vision", False),
-        vision_backbone=vision_backbone,
-        goal_type=goal_type,
-    ).to(device)
-    agent.load_state_dict(ckpt["agent"])
-    agent.eval()
-
-    obs_list = env.reset()
-    hp, cp, hg, cg = agent.initial_state(args.num_envs, device)
-    prev_rewards = np.zeros(args.num_envs, dtype=np.float32)
-    prev_actions = np.zeros(args.num_envs, dtype=np.int64)
-
-    max_iters = int(args.num_episodes / args.num_envs * args.max_steps * 2) + 16
-    with torch.no_grad():
-        for _ in range(max_iters):
-            if tracker.ep_total >= args.num_episodes:
-                break
-            view_t, scalar_t, pr_t, pa_t = obs_to_batch(
-                obs_list, device, view_shape, prev_rewards, prev_actions)
-            logits, value, hp, cp, hg, cg, _ = agent(
-                view_t, scalar_t, pr_t, pa_t, hp, cp, hg, cg)
-            act = torch.argmax(logits, dim=1).cpu().tolist()
-            next_obs, rewards, dones, infos = env.step(act)
-            for e in range(args.num_envs):
-                tracker.on_step(e, infos[e])
-                if dones[e]:
-                    tracker.on_episode_end(infos[e])
-                    next_obs[e] = env.reset(e)
-                    hp[:, e:e + 1, :] = 0.0
-                    cp[:, e:e + 1, :] = 0.0
-                    hg[:, e:e + 1, :] = 0.0
-                    cg[:, e:e + 1, :] = 0.0
-                    prev_rewards[e] = 0.0
-                    prev_actions[e] = 0
-                else:
-                    prev_rewards[e] = float(rewards[e])
-                    prev_actions[e] = int(act[e])
-            obs_list = next_obs
-    env.close()
-
-    _print_and_save("normal", "agent", args, tracker.arrivals,
+    mode, tag = ("oracle", "actual") if args.oracle else ("normal", "agent")
+    _print_and_save(mode, tag, args, tracker.arrivals,
                     tracker.oracles, tracker.spls, tracker.coverages,
                     tracker.t_half_list,
-                    (1.0 - tracker.ep_success / max(1, tracker.ep_total)))
+                    (1.0 - tracker.ep_success / max(1, tracker.ep_total)), band,
+                    tracker.success_steps)
 
 
 def parse_args():
@@ -308,12 +501,18 @@ def parse_args():
                    help="固定目标采样 RNG 种子；Agent/Oracle 两遍用相同值即可"
                         "抽到完全相同的目标序列，实现严格 head-to-head。默认=None"
                         "时使用 --seed。需配合相同的 --seed 与 --num_envs。")
+    p.add_argument("--goal_band", type=str, default="full",
+                   help="目标距离段：full=全图（默认）；stage=checkpoint 所在课程档"
+                        "（如 300m 档测 (200,300] 米）；或 'LOW,HIGH'（米）。")
     p.add_argument("--held_out", action="store_true", default=False,
                    help="泛化测试：目标只从留出(out)集合抽。")
     p.add_argument("--held_out_fraction", type=float, default=0.25)
     p.add_argument("--oracle", action="store_true", default=False,
                    help="Oracle 实跑评估（差异 6）：用 bearing 真正导航，"
                         "给出论文口径的 Oracle 实际上界与 T_1/2/失败率。")
+    p.add_argument("--ds_cache_dir", type=str, default=None,
+                   help="多环境数据集副本目录（同训练的 --ds_cache_dir）。默认系统"
+                        "临时目录；与数据集不在同一分区时会整份复制，可能写满 /tmp。")
     p.add_argument("--eval_csv", type=str, default="eval_results.csv",
                    help="把评估结果追加写入该 CSV（含 mode/tag 列），"
                         "便于多次评估后画对比图。")

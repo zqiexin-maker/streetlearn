@@ -41,13 +41,26 @@
       --dataset_path .../manhattan_2021_lowres \
       --num_envs 1 --num_trajectories 9 --max_steps 1000 \
       --out_dir ppo_ckpts --out_png traj_map.png
+
+多 checkpoint 批量出图（三种写法等价，--checkpoints/--ckpt-dir 优先于 --checkpoint）：
+  python -m streetlearn.python.ppo_traj_viz --checkpoints a.pt,b.pt,c.pt ...
+  python -m streetlearn.python.ppo_traj_viz --ckpt_dir runs/xxx --ckpt_pattern "ppo_*.pt" ...
+
+批量时每个 checkpoint 各出一张 traj_map_<名字>.png 与 trajectories_<名字>.npy，
+并汇总写 traj_summary.csv；相同 goal_seed 下各 checkpoint 面对完全一致的
+(起点, 目标) 序列，轨迹图可直接横向对比。
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import glob
+import json
 import math
 import os
+import re
+import sys
 import time
 
 import numpy as np
@@ -59,12 +72,17 @@ import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 
+from streetlearn.python.agents.ppo_agent import (
+    agent_kwargs_from_checkpoint,
+    describe_agent,
+)
 from streetlearn.python.ppo_train import (
     SubprocVecEnv,
     latlng_bbox_note,
     obs_to_batch,
     PPOAgent,
 )
+from streetlearn.python.ppo_eval import band_label, resolve_goal_band
 
 # 避免负号渲染成方块；字体顺序与 plot_ppo_eval.py 一致（英文标签用 DejaVu Sans，
 # CJK 字体留作中文字形回退）。
@@ -309,50 +327,65 @@ def draw_traj_map(coords, trajectories, png, goal_radius_m=100.0, subtitle=""):
     plt.close(fig)
 
 
-def run_traj_viz(args):
-    device = torch.device("cuda" if (args.cuda and torch.cuda.is_available())
-                          else "cpu")
+# --------------------------------------------------------------------------- #
+# 多 checkpoint：解析待可视化的 checkpoint 列表 & 环境复用签名
+# --------------------------------------------------------------------------- #
+def _split_list(value):
+    """'a.pt,b.pt' / ['a.pt','b.pt'] / None -> 路径列表（去空白、去重）。"""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    out = []
+    for it in items:
+        it = str(it).strip()
+        if it and it not in out:
+            out.append(it)
+    return out
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    config = ckpt["config"]
-    num_actions = ckpt["num_actions"]
-    hidden_size = ckpt.get("hidden_size", 512)
-    aux_heading = ckpt.get("aux_heading", False)
-    goal_type = ckpt.get("goal_type", "target_latlng")
-    vision_backbone = ckpt.get("vision_backbone", "resnet18")
-    # 环境与 _rescale_latlng 都用 checkpoint 自带 config 的 bbox，新旧口径各自正确。
-    print("[TRAJ] latlng bbox (from checkpoint): %s" % latlng_bbox_note(config))
 
-    # ---- 环境：单环境即可（可视化不需要吞吐）；复用评估同款控制接口 ----
-    env = SubprocVecEnv(args.dataset_path, config, args.num_envs)
-    goal_seed = args.goal_seed if args.goal_seed is not None else args.seed
-    env.set_goal_seed(goal_seed)
-    env.set_single_goal_mode(True)
-    print("[TRAJ] goal_seed=%d single-goal mode ON (到达即成功，episode 结束由"
-          " frame_cap 控制)" % goal_seed)
+def resolve_checkpoints(args):
+    """合并 --checkpoints（逗号分隔）与 --ckpt_dir 通配，回退 --checkpoint。
 
-    agent = PPOAgent(
-        num_actions=num_actions,
-        hidden_size=hidden_size,
-        aux_heading=aux_heading,
-        pretrained_vision=ckpt.get("pretrained_vision", False),
-        vision_backbone=vision_backbone,
-        goal_type=goal_type,
-    ).to(device)
-    agent.load_state_dict(ckpt["agent"])
-    agent.eval()
+    优先级：--checkpoints / --ckpt_dir > --checkpoint；结果按训练轮次排序
+    （ppo_iter_N.pt 按 N 升序，其余按文件名排在最后）。
+    """
+    paths = _split_list(getattr(args, "checkpoints", None))
+    ckpt_dir = getattr(args, "ckpt_dir", None)
+    if ckpt_dir:
+        paths += sorted(glob.glob(os.path.join(
+            ckpt_dir, getattr(args, "ckpt_pattern", None) or "*.pt")))
+    if not paths:
+        paths = [args.checkpoint] if args.checkpoint else []
+    seen, out = set(), []
+    for p in paths:
+        key = os.path.abspath(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
 
+    def sort_key(p):
+        m = re.search(r"ppo_iter_(\d+)", os.path.basename(p))
+        return (int(m.group(1)) if m else 1 << 30, os.path.basename(p))
+
+    return sorted(out, key=sort_key)
+
+
+def _config_signature(config):
+    """环境复用签名：config 完全相同才复用 SubprocVecEnv（否则重建）。"""
+    return json.dumps(config, sort_keys=True, default=str)
+
+
+def _rollout(env, agent, config, args, device, obs_list):
+    """跑 N 条完整导航并记录轨迹（贪心动作；到达即停）。
+
+    obs_list 为第 1 条轨迹的初始观测（reset 后、step 前）。
+    """
     view_shape = (3, config["height"], config["width"])
     n_traj = args.num_trajectories
     trajectories = []       # 每条: {"latlng": [(lat,lng), ...], "goal": (lat,lng),
                             #        "steps": int, "success": bool, "spl": float}
     t0 = time.time()
     ep = 0
-    # 起点也算轨迹的一部分（reset 后、step 前记录一次）。
-    obs_list = env.reset()
-    # 整张图所有 pano 的坐标（画全图散点底图用；图在 reset 时建立，之后不变）。
-    coords = env.get_map()
-    print("[TRAJ] street graph: %d panos" % len(coords))
     while ep < n_traj:
         hp, cp, hg, cg = agent.initial_state(args.num_envs, device)
         prev_rewards = np.zeros(args.num_envs, dtype=np.float32)
@@ -406,37 +439,155 @@ def run_traj_viz(args):
               % (ep, n_traj, steps_used, success, spl, time.time() - t0))
         obs_list = env.reset()  # 下一条轨迹重新开局
 
+    return trajectories
+
+
+def _save_summary(summary, args):
+    """多 checkpoint 汇总：打印横向对比表并写 traj_summary.csv。"""
+    if not summary:
+        return
+    print("=" * 78)
+    print("[TRAJ] per-checkpoint summary (%d ckpts):" % len(summary))
+    print("  %-34s %7s %12s %11s %5s %6s %8s %9s"
+          % ("checkpoint", "update", "steps", "goal_band", "traj", "succ",
+             "succ%", "meanSPL"))
+    for s in summary:
+        name = os.path.basename(s["checkpoint"])
+        print("  %-34s %7s %12s %11s %5d %6d %7.0f%% %9.3f"
+              % (name[:34],
+                 "-" if s["update"] is None else s["update"],
+                 "-" if s["global_step"] is None
+                 else format(s["global_step"], ","),
+                 s["goal_band"], s["trajectories"], s["success"],
+                 100.0 * s["success_rate"], s["mean_spl"]))
+    print("=" * 78)
+    csv_path = os.path.join(args.out_dir, "traj_summary.csv")
+    fields = ["checkpoint", "update", "global_step", "goal_band", "trajectories",
+              "success", "success_rate", "mean_steps", "mean_spl", "png"]
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for s in summary:
+            w.writerow(s)
+    print("[TRAJ] wrote summary -> %s" % csv_path)
+
+
+def run_traj_viz(args):
+    device = torch.device("cuda" if (args.cuda and torch.cuda.is_available())
+                          else "cpu")
+    goal_seed = args.goal_seed if args.goal_seed is not None else args.seed
+    checkpoints = resolve_checkpoints(args)
+    if not checkpoints:
+        print("[TRAJ] 未指定 checkpoint（--checkpoint / --checkpoints / "
+              "--ckpt_dir 至少给一个）")
+        sys.exit(2)
+    missing = [p for p in checkpoints if not os.path.isfile(p)]
+    if missing:
+        print("[TRAJ] checkpoint 不存在: %s" % ", ".join(missing))
+        sys.exit(2)
+    if len(checkpoints) > 1:
+        print("[TRAJ] %d checkpoints -> 每个各出一张轨迹图（goal_seed=%d；"
+              "goal_band 相同的 ckpt 面对相同 (起点, 目标) 序列，可直接对比）"
+              % (len(checkpoints), goal_seed))
+        for p in checkpoints:
+            print("    - %s" % p)
+
+    env, cur_sig, coords = None, None, None
+    single = len(checkpoints) == 1
+    summary = []
+    for ci, ckpt_path in enumerate(checkpoints, start=1):
+        stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+        print("\n[TRAJ] ===== checkpoint %d/%d: %s ====="
+              % (ci, len(checkpoints), os.path.basename(ckpt_path)))
+        # 本项目自己存的 checkpoint（含 config 字典），PyTorch 2.6+ 默认的
+        # weights_only=True 会拒绝加载。
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        config = ckpt["config"]
+        band = resolve_goal_band(args.goal_band, ckpt)
+        # 环境与 _rescale_latlng 都用 checkpoint 自带 config 的 bbox，新旧口径
+        # 各自正确；config 相同的相邻 checkpoint 复用同一套环境进程（省去重复
+        # spawn + 数据集拷贝的开销）。
+        print("[TRAJ] latlng bbox (from checkpoint): %s" % latlng_bbox_note(config))
+        if env is None or _config_signature(config) != cur_sig:
+            if env is not None:
+                env.close()
+            env = SubprocVecEnv(args.dataset_path, config, args.num_envs,
+                                cache_dir=args.ds_cache_dir)
+            cur_sig = _config_signature(config)
+            # 首次 reset 会建整张图（起点取图的根节点），之后的 reset 才是按
+            # 种子随机重生。先空跑一次，保证每个 checkpoint 都走同一条路径，
+            # 相同 goal_seed 下面对完全一致的 (起点, 目标) 序列。
+            env.reset()
+            coords = env.get_map()
+            print("[TRAJ] street graph: %d panos" % len(coords))
+        # 每个 checkpoint 前重置目标 RNG：相同 goal_seed（与相同 goal_band）下
+        # 各 ckpt 抽到完全一致的 (起点, 目标) 序列，轨迹图可直接横向对比。
+        env.set_goal_seed(goal_seed)
+        env.set_single_goal_mode(True)
+        if band is None:
+            env.set_max_target_distance(None)
+        else:
+            env.set_target_distance_band(*band)
+        print("[TRAJ] goal_seed=%d goal_band=%s single-goal mode ON (到达即成功，"
+              "episode 结束由 frame_cap 控制)" % (goal_seed, band_label(band)))
+
+        # 网络结构 / 输入遮蔽按 checkpoint 元数据重建（与 ppo_eval 同一规则）。
+        agent = PPOAgent(**agent_kwargs_from_checkpoint(ckpt)).to(device)
+        agent.load_state_dict(ckpt["agent"])
+        agent.eval()
+        print("[TRAJ] model (from checkpoint): %s" % describe_agent(agent))
+
+        # 起点也算轨迹的一部分（reset 后、step 前记录一次）。
+        obs_list = env.reset()
+        trajectories = _rollout(env, agent, config, args, device, obs_list)
+
+        # ---- 画全图轨迹 + 数据落盘（多 ckpt 时文件名带 checkpoint 名） ----
+        os.makedirs(args.out_dir, exist_ok=True)
+        png = os.path.join(args.out_dir,
+                           args.out_png if single
+                           else "%s_%s" % (stem, args.out_png))
+        draw_traj_map(coords, trajectories, png,
+                      goal_radius_m=float(config.get("min_radius_meters", 100.0)),
+                      subtitle="%s · goals %s · max %d steps · goal_seed %d"
+                      % (os.path.basename(ckpt_path), band_label(band),
+                         args.max_steps, goal_seed))
+        print("[TRAJ] wrote trajectories map -> %s" % png)
+        npy = os.path.join(args.out_dir,
+                           "trajectories.npy" if single
+                           else "trajectories_%s.npy" % stem)
+        np.save(npy, np.array(trajectories, dtype=object), allow_pickle=True)
+        print("[TRAJ] wrote trajectories data -> %s" % npy)
+
+        n_succ = sum(tr["success"] for tr in trajectories)
+        summary.append({
+            "checkpoint": ckpt_path,
+            "update": ckpt.get("update"),
+            "global_step": ckpt.get("global_step"),
+            "goal_band": band_label(band),
+            "trajectories": len(trajectories),
+            "success": n_succ,
+            "success_rate": n_succ / max(1, len(trajectories)),
+            "mean_steps": float(np.mean([tr["steps"] for tr in trajectories])),
+            "mean_spl": float(np.mean([tr["spl"] for tr in trajectories])),
+            "png": png,
+        })
+
     env.close()
-
-    # ---- 汇总打印 ----
-    n_succ = sum(tr["success"] for tr in trajectories)
-    print("=" * 68)
-    print("[TRAJ] trajectories=%d  success=%d/%d (%.0f%%)  "
-          "ave_steps=%.1f  mean_spl=%.3f"
-          % (n_traj, n_succ, n_traj, 100.0 * n_succ / max(1, n_traj),
-             float(np.mean([tr["steps"] for tr in trajectories])),
-             float(np.mean([tr["spl"] for tr in trajectories]))))
-    print("=" * 68)
-
-    # ---- 画全图轨迹 ----
-    os.makedirs(args.out_dir, exist_ok=True)
-    png = os.path.join(args.out_dir, args.out_png)
-    draw_traj_map(coords, trajectories, png,
-                  goal_radius_m=float(config.get("min_radius_meters", 100.0)),
-                  subtitle="%s · max %d steps · goal_seed %d"
-                  % (os.path.basename(args.checkpoint), args.max_steps,
-                     goal_seed))
-    print("[TRAJ] wrote trajectories map -> %s" % png)
-
-    # ---- 轨迹数据落盘（便于事后重画/分析） ----
-    np.save(os.path.join(args.out_dir, "trajectories.npy"),
-            np.array(trajectories, dtype=object), allow_pickle=True)
-    print("[TRAJ] wrote trajectories data -> %s/trajectories.npy" % args.out_dir)
+    _save_summary(summary, args)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="StreetLearn PPO 轨迹可视化")
-    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="单个 checkpoint；给了 --checkpoints/--ckpt-dir 时忽略")
+    p.add_argument("--checkpoints", type=str, default=None,
+                   help="逗号分隔的多个 checkpoint，逐个出轨迹图并汇总对比")
+    p.add_argument("--ckpt-dir", "--ckpt_dir", dest="ckpt_dir", type=str,
+                   default=None,
+                   help="目录：按 --ckpt-pattern 通配取全部 .pt 逐个出图")
+    p.add_argument("--ckpt-pattern", "--ckpt_pattern", dest="ckpt_pattern",
+                   type=str, default="*.pt",
+                   help="配合 --ckpt-dir 的通配符（默认 *.pt）")
     p.add_argument("--dataset_path", type=str, required=True)
     p.add_argument("--num_envs", type=int, default=1,
                    help="可视化用 1 个环境即可；>1 时仅记录 env 0 的轨迹。")
@@ -448,6 +599,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--goal_seed", type=int, default=None,
                    help="固定目标采样种子（默认取 --seed）。")
+    p.add_argument("--goal_band", type=str, default="full",
+                   help="目标距离段：full=全图（默认）；stage=每个 checkpoint 所在"
+                        "课程档；或 'LOW,HIGH'（米）。")
+    p.add_argument("--ds_cache_dir", type=str, default=None,
+                   help="num_envs>1 时数据集副本目录（同训练的 --ds_cache_dir）。")
     p.add_argument("--out_dir", type=str, default="traj_out")
     p.add_argument("--out_png", type=str, default="traj_map.png")
     return p.parse_args()

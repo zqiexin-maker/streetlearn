@@ -46,6 +46,11 @@ DEFAULT_CONFIG = {
     'max_reward_per_goal': 10.0,
     'min_radius_meters': 100.0,
     'max_radius_meters': 200.0,
+    # 塑形窗口自适应：>0 时 R_out = clamp(ratio × 目标初始距离,
+    # min_radius×1.05, max_radius_meters)；<=0 为原版固定窗口。
+    'shaping_radius_ratio': 0.0,
+    # 塑形奖励相对到达全奖的折扣（1.0 = 不打折）。
+    'shaping_scale': 1.0,
     'timestamp_start_curriculum': 0.0,
     'annealing_rate_curriculum': 2.0,
     'hours_curriculum_part_1': 0.0,

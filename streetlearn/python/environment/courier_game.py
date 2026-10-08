@@ -52,6 +52,14 @@ class CourierGame(coin_game.CoinGame):
     self._min_radius_meters = config['min_radius_meters']
     self._max_radius_meters = config['max_radius_meters']
     self._goal_timeout = config['goal_timeout']
+    # 塑形窗口：默认固定用 max_radius_meters（原版行为）。
+    # shaping_radius_ratio > 0 时改为按"本目标初始直线距离"自适应
+    # （见 _update_shaping_radius），使进入塑形区间的那一刻奖励等级≈0，
+    # 避免像原版那种"塑形窗口(200m) << 课程起点(500m)"的隐含约束被打破后，
+    # 目标刚一分配就白拿高额塑形奖励（800m 窗口 + 200m 目标 → 首步即 0.87×L）。
+    self._shaping_radius_ratio = float(config.get('shaping_radius_ratio', 0.0))
+    self._shaping_scale = float(config.get('shaping_scale', 1.0))
+    self._shaping_radius_meters = self._max_radius_meters
     self._colors['goal'] = color.Color(*config['color_for_goal'])
     self._colors['shortest_path'] = color.Color(
         *config['color_for_shortest_path'])
@@ -68,6 +76,9 @@ class CourierGame(coin_game.CoinGame):
     # ---- P1/P2 扩展状态 ----
     # 课程学习：目标与当前位置的最大距离（米）。None = 不限制（全图）。
     self._max_target_distance = None
+    self._min_target_distance = None
+    self._strict_target_distance = False
+    self._end_on_success = False
     # held-out 泛化：目标只能从这个集合里抽（None = 不限制）。
     self._allowed_goal_set = None
     # held-out 拆分参数（延迟到首次选目标时按图计算）。
@@ -78,6 +89,10 @@ class CourierGame(coin_game.CoinGame):
     # 本 episode 累计的"到达全奖"（论文口径，排除塑形/硬币）与 BFS Oracle 上界。
     self._episode_arrival_reward = 0.0
     self._episode_oracle_reward = 0.0
+    # 本 episode 塑形 / 硬币分支实际发出的原始奖励（与到达奖励分开记，训练端据此
+    # 判断回报主要来自送达还是辅助奖励）。
+    self._episode_shaping_reward = 0.0
+    self._episode_coin_reward = 0.0
 
     # ---- 评估 head-to-head 扩展 ----
     # 目标采样独立 RNG（由 --goal_seed 决定），与全局 np.random 解耦，保证
@@ -110,6 +125,8 @@ class CourierGame(coin_game.CoinGame):
     # 首个目标在 _pick_random_goal 里累加的 oracle 计数）。
     self._episode_arrival_reward = 0.0
     self._episode_oracle_reward = 0.0
+    self._episode_shaping_reward = 0.0
+    self._episode_coin_reward = 0.0
     self._reached_this_episode = False
 
     # Assign the goal location to one of the panos.
@@ -143,11 +160,21 @@ class CourierGame(coin_game.CoinGame):
                    self._num_steps_this_goal)
       self._num_steps_this_goal = 0
       if not self._single_goal:
-        self._pick_random_goal(streetlearn)  # 重新选目标（多目标模式）
+        try:
+          self._pick_random_goal(streetlearn)  # 重新选目标（多目标模式）
+        except ValueError as exc:
+          if not self._strict_target_distance or not str(exc).startswith(
+              ('No goal', 'No eligible goal')):
+            raise
+          self._timed_out = True
+          return 0.0
       # 单目标模式：保持同一目标，继续尝试直到 episode 结束。
 
     # ② ★ 计算奖励
     (reward, found_goal) = self._compute_reward(streetlearn)  # → 跳转_compute_reward方法
+    if not found_goal:
+      # 没到达时 _compute_reward 发出的只可能是塑形奖励（或 0）。
+      self._episode_shaping_reward += reward
 
     # If we have found the goal, set a new one and update episode statistics.
     # ③ 成功→重选目标 + 记录SPL
@@ -165,13 +192,20 @@ class CourierGame(coin_game.CoinGame):
         # 单目标 head-to-head：标记已到达，不再重抽（避免重复计分 / 破坏目标对齐）。
         self._reached_this_episode = True
       else:
-        self._pick_random_goal(streetlearn)
-        self._num_steps_this_goal = 0
+        try:
+          self._pick_random_goal(streetlearn)
+          self._num_steps_this_goal = 0
+        except ValueError as exc:
+          if not self._strict_target_distance or not str(exc).startswith(
+              ('No goal', 'No eligible goal')):
+            raise
+          self._timed_out = True
 
     # Give additional reward if current pano has a coin.
     # ④ 硬币奖励叠加
     if streetlearn.current_pano_id in self._coin_pano_id_set:
       reward += self._reward_per_coin
+      self._episode_coin_reward += self._reward_per_coin
       self._coin_pano_id_set.remove(streetlearn.current_pano_id)
 
     self._num_steps_this_goal += 1
@@ -190,7 +224,13 @@ class CourierGame(coin_game.CoinGame):
     info['current_goal_id'] = self._current_goal_id
     info['min_distance_reached'] = self._min_distance_reached
     info['initial_distance_to_goal'] = self._initial_distance_to_goal
+    # 当前到目标的直线距离。min_distance_reached 只在塑形窗口内才更新，
+    # 自适应窗口（0.4 × 初始距离）下用它算 T_1/2 会把半程点漏掉。
+    if self._current_goal_id is not None:
+      info['distance_to_goal'] = streetlearn.engine.GetPanoDistance(
+          streetlearn.current_pano_id, self._current_goal_id)
     info['reward_current_goal'] = self._reward_current_goal
+    info['shaping_radius_meters'] = self._shaping_radius_meters
     num_successes = len(self._success_inverse_path_len)
     info['num_successes'] = num_successes
     info['spl'] = sum(self._success_inverse_path_len) / (num_successes + 1)
@@ -221,6 +261,9 @@ class CourierGame(coin_game.CoinGame):
     # /评估循环统计与论文 Table 2 对齐的指标。
     info['arrival_reward'] = self._episode_arrival_reward
     info['oracle_reward'] = self._episode_oracle_reward
+    # 本 episode 塑形 / 硬币分支实际发出的原始奖励（三项相加 = 原始总奖励）。
+    info['shaping_reward'] = self._episode_shaping_reward
+    info['coin_reward'] = self._episode_coin_reward
     info['coverage'] = (self._episode_arrival_reward /
                          self._episode_oracle_reward
                          if self._episode_oracle_reward > 0 else 0.0)
@@ -233,6 +276,8 @@ class CourierGame(coin_game.CoinGame):
     During a single episode, every time a goal is found, a new one is chosen,
     until the time runs out.
     """
+    if self._end_on_success and self._reached_this_episode:
+      return True
     if self._timed_out:
       self._timed_out = False
       return True
@@ -262,14 +307,22 @@ class CourierGame(coin_game.CoinGame):
     if allowed is not None:
       pool = [goal for goal in pool if goal in allowed]
     # 课程学习：限制目标与当前位置的距离不超过 _max_target_distance。
-    if self._max_target_distance is not None:
+    if self._max_target_distance is not None or self._min_target_distance is not None:
       cur = streetlearn.current_pano_id
       maxd = self._max_target_distance
-      dpool = [goal for goal in pool
-               if streetlearn.engine.GetPanoDistance(cur, goal) <= maxd]
+      dpool = []
+      for goal in pool:
+        distance = streetlearn.engine.GetPanoDistance(cur, goal)
+        if ((maxd is None or distance <= maxd) and
+            (self._min_target_distance is None or distance > self._min_target_distance)):
+          dpool.append(goal)
       if dpool:
         pool = dpool   # 仅当距离约束下仍有候选才采用，避免约束过紧导致无候选
+      elif self._strict_target_distance:
+        raise ValueError('No goal in requested distance band for this start')
     if not pool:
+      if self._strict_target_distance:
+        raise ValueError('No eligible goal for this start')
       pool = base      # 极端兜底：放宽所有约束
 
     # goal_seed 模式：用独立的、由 goal_seed 决定的 RNG，保证 Agent/Oracle 两遍
@@ -284,9 +337,20 @@ class CourierGame(coin_game.CoinGame):
   # ---------------------------------------------------------------------------
   # P1/P2 控制接口（供训练循环 / 评估脚本通过 SubprocVecEnv 调用）
   # ---------------------------------------------------------------------------
-  def set_max_target_distance(self, meters):
-    """课程学习：限制新目标与当前位置的最大距离（米）。meters=None 解除限制。"""
+  def set_max_target_distance(self, meters, strict=False):
+    """限制新目标距离；严格模式无候选时重开 episode。"""
     self._max_target_distance = meters
+    self._min_target_distance = None
+    self._strict_target_distance = bool(strict)
+
+  def set_target_distance_band(self, min_meters, max_meters):
+    """严格评估距离段；无候选时让 worker 重新选择起点。"""
+    self._min_target_distance = min_meters
+    self._max_target_distance = max_meters
+    self._strict_target_distance = True
+
+  def set_end_on_success(self, flag):
+    self._end_on_success = bool(flag)
 
   def set_allowed_goal_set(self, pano_set):
     """泛化评估：限制目标只能从给定 pano 集合抽（None=不限制）。"""
@@ -297,6 +361,10 @@ class CourierGame(coin_game.CoinGame):
     抽到完全相同的目标序列。seed 通常取 goal_seed + worker_id 偏移，保证各
     worker 目标不同但跨 run 可复现。未调用则沿用全局 np.random（非确定性）。"""
     self._goal_rng = np.random.RandomState(seed)
+
+  def clear_goal_seed(self):
+    """撤销 set_goal_seed：目标采样回到全局 np.random（课程测试结束后恢复训练用）。"""
+    self._goal_rng = None
 
   def set_single_goal_mode(self, flag):
     """评估 head-to-head：每 episode 只分配 1 个目标（到达后不重抽），
@@ -344,6 +412,12 @@ class CourierGame(coin_game.CoinGame):
     """
     self._visited_panos.clear()
     self._sample_random_goal(streetlearn)
+    # 目标距离确定后才算塑形窗口（依赖 _initial_distance_to_goal）。
+    self._update_shaping_radius()
+    if self._shaping_radius_ratio > 0:
+      logging.info('seed %d, frame %d: shaping radius=%f for initial distance %f',
+                   streetlearn.seed, streetlearn.frame_count,
+                   self._shaping_radius_meters, self._initial_distance_to_goal)
     logging.info('seed %d, frame %d: new goal id: %s distance: %f',
                  streetlearn.seed, streetlearn.frame_count, self.goal_id,
                  self._min_distance_reached)
@@ -368,6 +442,37 @@ class CourierGame(coin_game.CoinGame):
     for pano_id in six.iterkeys(shortest_path):
       self._pano_id_to_color[pano_id] = self._colors['shortest_path']
     self._pano_id_to_color[self.goal_id] = self._colors['goal']
+
+  def set_shaping_radius_ratio(self, ratio):
+    """运行期切换塑形窗口自适应比例；<=0 表示回到固定 max_radius_meters。"""
+    self._shaping_radius_ratio = float(ratio)
+
+  def _update_shaping_radius(self):
+    """按本目标的初始直线距离重算塑形窗口外边界 R_out。
+
+    ratio <= 0：固定窗口（原版行为），R_out = max_radius_meters。
+    ratio >  0：R_out = clamp(ratio × D0, min_radius×1.05, max_radius_meters)
+
+    设计依据（对照原版 C++ 实现）：原版 min/max_radius 是常量且从不联动课程，
+    靠"课程起点 500m 远大于塑形窗口 200m"这条隐含约束让塑形只充当最后一段的
+    归航提示。本项目的课程从 200m 起步时该约束失效，故显式重建成同一不变量：
+    **进入塑形区间那一刻的奖励必须≈0**，否则每次刷新最近距离都按"当前等级全款"
+    支付（本函数不是势函数增量），累积塑形会数十倍压过到达奖励。
+
+    ratio=0.4 即复刻原版几何（200/500）；越大越早进入塑形（越接近稠密进度条）。
+    """
+    ratio = self._shaping_radius_ratio
+    if ratio is None or ratio <= 0:
+      self._shaping_radius_meters = self._max_radius_meters
+      return
+    initial = self._initial_distance_to_goal
+    if not np.isfinite(initial):
+      self._shaping_radius_meters = self._max_radius_meters
+      return
+    # 下界留出 5% 余量，避免 (R_out - min_radius) 退化为 0 导致除零/无梯度。
+    lower = self._min_radius_meters * 1.05
+    radius = max(lower, ratio * float(initial))
+    self._shaping_radius_meters = min(radius, self._max_radius_meters)
 
   def _compute_reward(self, streetlearn):
     """Reward is a piecewise linear function of distance to the goal.
@@ -410,14 +515,18 @@ class CourierGame(coin_game.CoinGame):
           'seed %d, frame %d: reached goal, distance_to_goal=%s, reward=%s',
           streetlearn.seed, streetlearn.frame_count, distance_to_goal, reward)
     else:
-      if distance_to_goal < self._max_radius_meters:
+      # 塑形区间的外边界按当前目标自适应（见 _update_shaping_radius）；
+      # 固定模式下它恒等于 max_radius_meters，与原版一致。
+      shaping_radius = self._shaping_radius_meters
+      if distance_to_goal < shaping_radius and \
+          shaping_radius > self._min_radius_meters:
         # Early reward shaping.
         # ★ 中间区域：分段线性塑形奖励
         # 只有当距离比之前最近距离更近时才给奖励（单调递减才奖）
         if distance_to_goal < self._min_distance_reached:
-          reward = (self._reward_current_goal *
-                    (self._max_radius_meters - distance_to_goal) /
-                    (self._max_radius_meters - self._min_radius_meters))
+          reward = (self._reward_current_goal * self._shaping_scale *
+                    (shaping_radius - distance_to_goal) /
+                    (shaping_radius - self._min_radius_meters))
           self._min_distance_reached = distance_to_goal
           logging.info('seed %d, frame %d: distance_to_goal=%f, reward=%d',
                        streetlearn.seed, streetlearn.frame_count,

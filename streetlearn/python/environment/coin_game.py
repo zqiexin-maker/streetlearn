@@ -98,10 +98,14 @@ class CoinGame(game.Game):
     self._touched_pano_id_set.clear()
     num_pano_ids = len(self._pano_ids)
     self._num_coins = int(self._proportion_of_panos_with_coins * num_pano_ids)
-    print("Sampling {} coins in graph of {} panos.".format(
-        self._num_coins, num_pano_ids))
-    self._coin_pano_id_set = np.random.choice(
-        self._pano_ids, self._num_coins, replace=False).tolist()
+    if self._num_coins:
+      print("Sampling {} coins in graph of {} panos.".format(
+          self._num_coins, num_pano_ids))
+      self._coin_pano_id_set = np.random.choice(
+          self._pano_ids, self._num_coins, replace=False).tolist()
+    else:
+      # 关闭金币时不必每次 reset 都对整张图做一次随机排列。
+      self._coin_pano_id_set = []
     self._pano_id_to_color = {coin_pano_id: self._colors['coin']
                               for coin_pano_id in self._coin_pano_id_set}
 
